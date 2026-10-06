@@ -10,6 +10,7 @@ one folder per tool. Each folder has a README with the details.
 | [clipsecret](clipsecret/) | Move secrets between the clipboard and AWS Secrets Manager without ever printing them | Bash, Python |
 | [csv-epoch-localtime](csv-epoch-localtime/) | Rewrite epoch UTC timestamps in a CSV (e.g. a Zoom chat export) as local time | Python |
 | [ecs-ir-capture](ecs-ir-capture/) | Read-only incident-response capture on ECS/EC2 hosts via SSM: binaries, environment, container diff and logs of matching processes | Bash |
+| [flowlog-fanout](flowlog-fanout/) | Flag sources whose fan-out (distinct destination IPs per time bin) spikes in VPC flow logs, via Logs Insights | Python |
 | [ssm-run](ssm-run/) | Run a local shell script on EC2 instances through SSM Run Command and print each instance's output | Python |
 
 ## Conventions

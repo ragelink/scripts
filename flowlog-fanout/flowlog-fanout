@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""flowlog-fanout: flag sources whose fan-out spikes in VPC flow logs.
+
+Runs a CloudWatch Logs Insights query over a VPC flow-log group, counts the
+distinct destination IPs each source reached per time bin on the given ports,
+and flags bins where a source went above FACTOR times its own median. Port
+scanners and worm-like spreading look like this.
+
+Exit status: 0 nothing flagged, 1 something flagged, 2 usage or runtime error.
+"""
+import argparse
+import datetime
+import ipaddress
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+
+PROG = "flowlog-fanout"
+VERSION = "1.0.0"
+UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+MAX_LIMIT = 10000  # the most rows Logs Insights returns for one query
+UTC = datetime.timezone.utc
+COLUMNS = ["time", "source", "dests", "flows", "median", "ratio"]
+
+
+class Failure(Exception):
+    """A runtime error: reported on stderr, exit status 2."""
+
+
+def warn(msg):
+    sys.stderr.write("%s: %s\n" % (PROG, msg))
+
+
+# ---------- time ----------
+TIME_RE = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})"
+    r"(?:[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.[0-9]+)?)?)?"
+    r"(Z|[+-][0-9]{2}:?[0-9]{2})?",
+    re.IGNORECASE,
+)
+BIN_TIME_RE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?Z?")
+
+
+def parse_duration(text):
+    """Seconds in a duration like 90m or 6h, or None."""
+    m = re.fullmatch(r"([0-9]+)([smhd])", text)
+    if not m or int(m.group(1)) == 0:
+        return None
+    return int(m.group(1)) * UNITS[m.group(2)]
+
+
+def parse_time(text):
+    """Epoch seconds for epoch seconds or an ISO 8601 time (UTC unless it has an offset), or None."""
+    text = text.strip()
+    if re.fullmatch(r"[0-9]+", text):
+        return int(text)
+    m = TIME_RE.fullmatch(text)
+    if not m:
+        return None
+    year, month, day, hour, minute, second, zone = m.groups()
+    try:
+        dt = datetime.datetime(int(year), int(month), int(day), int(hour or 0),
+                               int(minute or 0), int(second or 0), tzinfo=UTC)
+    except ValueError:
+        return None
+    if zone and zone.upper() != "Z":
+        digits = zone[1:].replace(":", "")
+        offset = datetime.timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+        dt = dt - offset if zone[0] == "+" else dt + offset
+    return int(dt.timestamp())
+
+
+def parse_bin_time(text):
+    """Epoch seconds for a bin timestamp from Insights, e.g. '2026-10-06 00:05:00.000' (UTC)."""
+    m = BIN_TIME_RE.fullmatch(text.strip())
+    if not m:
+        raise Failure("unexpected bin timestamp in the query results: %r" % text)
+    return int(datetime.datetime(*(int(g) for g in m.groups()), tzinfo=UTC).timestamp())
+
+
+def iso(epoch):
+    return datetime.datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- query ----------
+def build_query(ports, action, cidr, bin_text, limit):
+    lines = [
+        "fields @timestamp, srcAddr, dstAddr, dstPort",
+        "| filter dstPort in [%s]" % ",".join(str(p) for p in ports),
+    ]
+    if action != "ANY":
+        lines.append('| filter action = "%s"' % action)
+    if cidr:
+        lines.append('| filter isIpv4InSubnet(srcAddr, "%s")' % cidr)
+    lines += [
+        # No alias on bin(): its column is reported as "bin(5m)", which parse_row reads.
+        "| stats count_distinct(dstAddr) as dests, count(*) as flows by srcAddr, bin(%s)" % bin_text,
+        "| limit %d" % limit,
+    ]
+    return "\n".join(lines)
+
+
+class Aws:
+    """The aws CLI, with --profile/--region on every call and JSON output."""
+
+    def __init__(self, profile, region):
+        self.prefix = ["aws"]
+        if profile:
+            self.prefix += ["--profile", profile]
+        if region:
+            self.prefix += ["--region", region]
+        self.env = dict(os.environ, AWS_PAGER="")
+
+    def call(self, *args):
+        argv = self.prefix + list(args) + ["--output", "json"]
+        try:
+            proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        except FileNotFoundError:
+            raise Failure("aws CLI not found")
+        if proc.returncode != 0:
+            sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
+            raise Failure("aws %s %s failed (exit %d)" % (args[0], args[1], proc.returncode))
+        try:
+            return json.loads(proc.stdout.decode("utf-8"))
+        except ValueError:
+            raise Failure("could not parse the output of aws %s %s" % (args[0], args[1]))
+
+
+def parse_row(fields, bin_field):
+    """(bin start, source, distinct destinations, flows) from one result row, or None without a source."""
+    row = {f.get("field"): f.get("value") for f in fields}
+    if not row.get("srcAddr"):
+        return None
+    try:
+        return (parse_bin_time(row[bin_field]), row["srcAddr"], int(float(row["dests"])), int(float(row["flows"])))
+    except (KeyError, TypeError, ValueError):
+        raise Failure("unexpected row in the query results: %s" % json.dumps(row, sort_keys=True))
+
+
+class Runner:
+    """Runs the query over a time range, splitting the range while results come back truncated."""
+
+    def __init__(self, aws, log_group, query, limit, bin_text, bin_seconds, poll, timeout):
+        self.aws, self.log_group, self.query_string = aws, log_group, query
+        self.bin_field = "bin(%s)" % bin_text
+        self.limit, self.bin_seconds, self.poll, self.timeout = limit, bin_seconds, poll, timeout
+        self.queries = 0
+        self.bytes_scanned = 0.0
+        self.skipped = 0
+        self.current = None  # the running query's id, to stop it on Ctrl-C
+
+    def stop(self, qid):
+        self.current = None
+        try:
+            self.aws.call("logs", "stop-query", "--query-id", qid)
+        except Failure as e:
+            warn("could not stop query %s: %s" % (qid, e))
+
+    def run(self, start, end):
+        """Raw rows for [start, end] (both inclusive, epoch seconds)."""
+        self.queries += 1
+        qid = self.aws.call(
+            "logs", "start-query", "--log-group-name", self.log_group,
+            "--start-time", str(start), "--end-time", str(end),
+            "--query-string", self.query_string, "--limit", str(self.limit),
+        )["queryId"]
+        self.current = qid
+        deadline = time.monotonic() + self.timeout
+        while True:
+            res = self.aws.call("logs", "get-query-results", "--query-id", qid)
+            status = res.get("status")
+            if status == "Complete":
+                break
+            if status not in ("Scheduled", "Running"):
+                self.current = None
+                raise Failure("query %s ended with status %s" % (qid, status))
+            if time.monotonic() >= deadline:
+                self.stop(qid)
+                raise Failure("query %s did not finish within %gs; stopped it" % (qid, self.timeout))
+            time.sleep(self.poll)
+        self.current = None
+        self.bytes_scanned += float((res.get("statistics") or {}).get("bytesScanned") or 0)
+        rows = []
+        for fields in res.get("results") or []:
+            row = parse_row(fields, self.bin_field)
+            if row is None:
+                self.skipped += 1
+            else:
+                rows.append(row)
+        return rows, len(res.get("results") or [])
+
+    def boundary(self, start, end):
+        """The bin boundary nearest the middle of (start, end), or None when the range is one bin."""
+        size = self.bin_seconds
+        mid = (start + end) // 2 // size * size
+        if mid <= start:
+            mid += size
+        return mid if start < mid < end else None
+
+    def collect(self, start, end, keep_before=None):
+        """Rows for [start, end]. Adjacent chunks share their boundary second, so a chunk that
+        ends at a split boundary drops the rows of the bin starting there: the next chunk has
+        that bin in full."""
+        rows, count = self.run(start, end)
+        if count >= self.limit:
+            mid = self.boundary(start, end)
+            if mid is not None:
+                return self.collect(start, mid, mid) + self.collect(mid, end, keep_before)
+            warn("%s..%s returned %d rows, the query limit, within one bin; results may be incomplete"
+                 % (iso(start), iso(end), count))
+        if keep_before is not None:
+            rows = [r for r in rows if r[0] < keep_before]
+        return rows
+
+
+# ---------- analysis and output ----------
+def analyse(rows, factor, min_dests):
+    """Annotate each row with its source's median and ratio, and whether it is flagged."""
+    by_source = {}
+    for _, source, dests, _ in rows:
+        by_source.setdefault(source, []).append(dests)
+    medians = {source: statistics.median(values) for source, values in by_source.items()}
+    out = []
+    for t, source, dests, flows in rows:
+        median = medians[source]
+        ratio = dests / median if median > 0 else None
+        flagged = dests >= min_dests and (ratio is None or dests > factor * median)
+        out.append({"time": t, "source": source, "dests": dests, "flows": flows,
+                    "median": median, "ratio": ratio, "flagged": flagged})
+    return out, len(by_source)
+
+
+def show_median(m):
+    return "%d" % m if float(m).is_integer() else "%.1f" % m
+
+
+def show_ratio(r):
+    return "-" if r is None else "%.1f" % r
+
+
+def render(rows, fmt, with_flag):
+    if fmt == "json":
+        return json.dumps([{
+            "time": iso(r["time"]), "source": r["source"], "dests": r["dests"], "flows": r["flows"],
+            "median": r["median"], "ratio": None if r["ratio"] is None else round(r["ratio"], 2),
+            "flagged": r["flagged"],
+        } for r in rows], indent=2) + "\n"
+    header = COLUMNS + (["flagged"] if with_flag else [])
+    cells = [[iso(r["time"]), r["source"], str(r["dests"]), str(r["flows"]),
+              show_median(r["median"]), show_ratio(r["ratio"])]
+             + (["yes" if r["flagged"] else "no"] if with_flag else []) for r in rows]
+    if fmt == "tsv":
+        return "".join("\t".join(line) + "\n" for line in [header] + cells)
+    if not cells:
+        return ""
+    widths = [max(len(line[i]) for line in [header] + cells) for i in range(len(header))]
+    numeric = {"dests", "flows", "median", "ratio"}
+    out = []
+    for line in [header] + cells:
+        out.append("  ".join(
+            v.rjust(w) if name in numeric else v.ljust(w) for name, v, w in zip(header, line, widths)
+        ).rstrip() + "\n")
+    return "".join(out)
+
+
+# ---------- arguments ----------
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Flag VPC flow-log sources whose fan-out (distinct destination IPs per time bin "
+                    "on the given ports) jumps above FACTOR times the source's median.",
+        epilog="Exit status: 0 nothing flagged, 1 something flagged, 2 usage or runtime error.\n\n"
+               "Examples:\n"
+               "  %(prog)s --log-group /vpc/flow-logs --since 6h\n"
+               "  %(prog)s --log-group /vpc/flow-logs --start 2026-10-06T00:00Z --end 2026-10-06T12:00Z \\\n"
+               "      --ports 22,3389 --source-cidr 10.0.0.0/16 --action ACCEPT --profile acme",
+    )
+    p.add_argument("--log-group", required=True, metavar="NAME", help="flow-log group to query")
+    when = p.add_mutually_exclusive_group()
+    when.add_argument("--since", metavar="DURATION",
+                      help="range ending at --end (default now), e.g. 90m, 6h, 2d (default 1h)")
+    when.add_argument("--start", metavar="TIME",
+                      help="range start: ISO 8601 (UTC unless an offset is given) or epoch seconds")
+    p.add_argument("--end", metavar="TIME", help="range end, same formats (default now)")
+    p.add_argument("--bin", default="5m", help="time bin, e.g. 1m, 5m, 1h (default 5m)")
+    p.add_argument("--ports", default="80,443", help="destination ports, comma-separated (default 80,443)")
+    p.add_argument("--source-cidr", metavar="CIDR", help="only sources in this IPv4 CIDR")
+    p.add_argument("--action", default="ANY", type=str.upper, choices=["ACCEPT", "REJECT", "ANY"],
+                   help="only flows with this action (default ANY)")
+    p.add_argument("--factor", type=float, default=5.0,
+                   help="flag bins above FACTOR x the source's median (default 5)")
+    p.add_argument("--min-dests", type=int, default=20,
+                   help="a flagged bin needs at least this many destinations (default 20)")
+    p.add_argument("--all", action="store_true", help="print every row, with a flagged column")
+    p.add_argument("--format", choices=["table", "tsv", "json"], default="table", help="output format")
+    p.add_argument("--poll", type=float, default=2.0, metavar="SECONDS",
+                   help="seconds between result polls (default 2)")
+    p.add_argument("--timeout", type=float, default=300.0, metavar="SECONDS",
+                   help="give up on (and stop) a query after this long (default 300)")
+    p.add_argument("--query-limit", type=int, default=MAX_LIMIT, metavar="N",
+                   help="rows per query; a full result splits the range (default and maximum %d)" % MAX_LIMIT)
+    p.add_argument("--profile", metavar="NAME", help="AWS profile")
+    p.add_argument("--region", metavar="NAME", help="AWS region")
+    p.add_argument("-V", "--version", action="version", version="%s %s" % (PROG, VERSION))
+    args = p.parse_args(argv)
+
+    m = re.fullmatch(r"([0-9]+)([smhd])", args.bin)
+    if not m or int(m.group(1)) == 0:
+        p.error("--bin must look like 30s, 5m, 1h or 1d, got %r" % args.bin)
+    args.bin = "%d%s" % (int(m.group(1)), m.group(2))
+    args.bin_seconds = int(m.group(1)) * UNITS[m.group(2)]
+
+    ports = []
+    for part in args.ports.split(","):
+        part = part.strip()
+        if not re.fullmatch(r"[0-9]+", part) or int(part) > 65535:
+            p.error("--ports must be comma-separated port numbers (0-65535), got %r" % args.ports)
+        if int(part) not in ports:
+            ports.append(int(part))
+    args.port_list = ports
+
+    if args.source_cidr:
+        try:
+            net = ipaddress.ip_network(args.source_cidr, strict=False)
+        except ValueError:
+            p.error("--source-cidr is not a CIDR: %r" % args.source_cidr)
+        if net.version != 4:
+            p.error("--source-cidr must be IPv4 (Insights' isIpv4InSubnet), got %r" % args.source_cidr)
+        args.source_cidr = net.with_prefixlen
+
+    if not args.factor > 0:
+        p.error("--factor must be greater than 0")
+    if args.min_dests < 0:
+        p.error("--min-dests must not be negative")
+    if args.poll < 0:
+        p.error("--poll must not be negative")
+    if not args.timeout > 0:
+        p.error("--timeout must be greater than 0")
+    if not 1 <= args.query_limit <= MAX_LIMIT:
+        p.error("--query-limit must be between 1 and %d" % MAX_LIMIT)
+
+    # FLOWLOG_FANOUT_NOW (epoch seconds) is a test hook that fixes "now".
+    now = int(os.environ.get("FLOWLOG_FANOUT_NOW") or time.time())
+    if args.end is None:
+        args.end_epoch = now
+    else:
+        args.end_epoch = parse_time(args.end)
+        if args.end_epoch is None:
+            p.error("--end is not a time: %r" % args.end)
+    if args.start is not None:
+        args.start_epoch = parse_time(args.start)
+        if args.start_epoch is None:
+            p.error("--start is not a time: %r" % args.start)
+    else:
+        seconds = parse_duration(args.since or "1h")
+        if seconds is None:
+            p.error("--since must look like 90m, 6h or 2d, got %r" % args.since)
+        args.start_epoch = args.end_epoch - seconds
+    if args.start_epoch >= args.end_epoch:
+        p.error("the range is empty: start %s is not before end %s"
+                % (iso(args.start_epoch), iso(args.end_epoch)))
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    query = build_query(args.port_list, args.action, args.source_cidr, args.bin, args.query_limit)
+    runner = Runner(Aws(args.profile, args.region), args.log_group, query, args.query_limit,
+                    args.bin, args.bin_seconds, args.poll, args.timeout)
+    try:
+        rows = runner.collect(args.start_epoch, args.end_epoch)
+    except KeyboardInterrupt:
+        if runner.current:
+            runner.stop(runner.current)
+        warn("interrupted")
+        return 130
+    except Failure as e:
+        warn(str(e))
+        return 2
+
+    results, sources = analyse(rows, args.factor, args.min_dests)
+    flagged = [r for r in results if r["flagged"]]
+    if args.all:
+        shown = sorted(results, key=lambda r: (r["time"], r["source"]))
+    else:
+        shown = sorted(flagged, key=lambda r: (-(r["ratio"] if r["ratio"] is not None else float("inf")),
+                                               r["time"], r["source"]))
+    try:
+        sys.stdout.write(render(shown, args.format, args.all))
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+
+    summary = "%d %s, %d rows, %d sources, %d flagged (factor %g, min-dests %d)" % (
+        runner.queries, "query" if runner.queries == 1 else "queries", len(rows), sources,
+        len(flagged), args.factor, args.min_dests)
+    if runner.bytes_scanned:
+        summary += ", %.1f MB scanned" % (runner.bytes_scanned / 1e6)
+    warn(summary)
+    if runner.skipped:
+        warn("skipped %d result rows without a source address" % runner.skipped)
+    return 1 if flagged else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
