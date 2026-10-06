@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # make test: run every tool's test.sh. On macOS, also run them with the stock
-# /bin/bash 3.2, which is not first on PATH on most machines or on CI runners.
+# /bin/bash 3.2 when another bash comes first on PATH (Homebrew's, on most dev
+# machines). GitHub's macOS runners have /bin/bash first, so CI covers 3.2 there
+# and bash 5 on Ubuntu.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
