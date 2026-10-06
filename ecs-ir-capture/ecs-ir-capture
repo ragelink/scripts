@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# ecs-ir-capture: incident-response evidence capture on ECS/EC2 hosts, through SSM.
+#
+# For each process whose command line matches a pattern (processes inside containers
+# included), a host script saves the executable with its sha256, the command line,
+# the environment (secret-looking values redacted), memory maps, open files and, for
+# containers, `docker diff` and recent `docker logs`, into a 0700 directory on the
+# host. It then writes a manifest and a checksummed tarball, optionally uploaded to
+# S3. It never kills, stops or pauses anything. Run `ecs-ir-capture --help`.
+set -euo pipefail
+
+VERSION=1.0.0
+PROG=${0##*/}
+
+usage() {
+  cat <<EOF
+$PROG $VERSION - incident-response evidence capture on ECS/EC2 hosts, via SSM
+
+Usage:
+  $PROG --pattern REGEX (-i ID[,ID...] | -t KEY=VALUE ...) [options]
+  $PROG --pattern REGEX --print-script [options] > capture.sh
+
+For each process whose command line matches REGEX (extended regex, as grep -E),
+containers included, the host keeps in EVIDENCE-ROOT/<UTC time>-<hostname>/:
+  the executable read through /proc/PID/exe (sha256, then chmod 000), the command
+  line, the environment (values of names containing SECRET, PASSWORD, TOKEN or KEY
+  redacted), status, memory maps, open files, cwd, cgroup and container id; per
+  container, docker diff, recent docker logs and docker inspect fields (never the
+  environment); and ps, socket and docker ps listings of the host. Then a
+  MANIFEST.sha256, a .tar.gz and its .sha256, optionally uploaded to S3.
+  Nothing is killed, stopped or paused.
+
+Options:
+  -p, --pattern REGEX     processes to capture (required)
+  -i, --instance-ids IDS  target instances, comma-separated or repeated
+  -t, --tag KEY=VALUE     target instances by tag, repeatable
+  --max-procs N           capture at most N matching processes per host (default 20)
+  --log-since DURATION    docker logs window: 30m, 6h, ... (default 2h)
+  --no-redact             keep environment values whose names look secret
+  --s3-uri s3://BUCKET/PREFIX
+                          upload the tarball and its .sha256 from the host
+  --evidence-root DIR     evidence location on the host (default /var/tmp/ir-capture)
+  --timeout SECONDS       stop the capture on the host after SECONDS (default 900)
+  --output-dir DIR        keep each instance's SSM output locally (see ssm-run)
+  --print-script          print the host script instead of running it
+  --profile NAME          AWS profile
+  --region NAME           AWS region
+  -h, --help              show this help
+  -V, --version           show version
+
+The host script runs through ssm-run (from the same repository), found next to
+this script as ../ssm-run/ssm-run, or on PATH.
+EOF
+}
+
+die() { echo "$PROG: $*" >&2; exit 2; }
+
+# ---------- arguments ----------
+PATTERN="" MAX_PROCS=20 LOG_SINCE=2h REDACT=1 S3_URI="" EVIDENCE_ROOT=/var/tmp/ir-capture
+TIMEOUT=900 PRINT=0
+TARGETS=() PASS=()
+need() { [ $# -ge 2 ] || die "option $1 needs a value"; }
+while [ $# -gt 0 ]; do
+  case $1 in
+    -p | --pattern) need "$@"; PATTERN=$2; shift 2 ;;
+    -i | --instance-ids | -t | --tag) need "$@"; TARGETS+=("$1" "$2"); shift 2 ;;
+    --max-procs) need "$@"; MAX_PROCS=$2; shift 2 ;;
+    --log-since) need "$@"; LOG_SINCE=$2; shift 2 ;;
+    --no-redact) REDACT=0; shift ;;
+    --s3-uri) need "$@"; S3_URI=$2; shift 2 ;;
+    --evidence-root) need "$@"; EVIDENCE_ROOT=$2; shift 2 ;;
+    --timeout) need "$@"; TIMEOUT=$2; shift 2 ;;
+    --output-dir | --profile | --region) need "$@"; PASS+=("$1" "$2"); shift 2 ;;
+    --print-script) PRINT=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -V | --version) echo "$PROG $VERSION"; exit 0 ;;
+    *) die "unknown argument '$1' (see --help)" ;;
+  esac
+done
+[ -n "$PATTERN" ] || die "--pattern is required"
+# grep exits 2 on a bad regex, and 1 for no match on empty input
+rc=0
+grep -Eq -- "$PATTERN" </dev/null || rc=$?
+[ "$rc" -le 1 ] || die "--pattern is not a valid extended regex"
+case $MAX_PROCS in '' | *[!0-9]* | 0*) die "--max-procs needs a whole number above 0" ;; esac
+case $LOG_SINCE in [1-9]*[smh]) ;; *) die "--log-since needs a duration like 30m or 6h" ;; esac
+case ${LOG_SINCE%?} in *[!0-9]*) die "--log-since needs a duration like 30m or 6h" ;; esac
+case $TIMEOUT in '' | *[!0-9]* | 0*) die "--timeout needs a whole number of seconds above 0" ;; esac
+case $S3_URI in '' | s3://?*) ;; *) die "--s3-uri must look like s3://bucket/prefix" ;; esac
+case $EVIDENCE_ROOT in /?*) ;; *) die "--evidence-root must be an absolute path" ;; esac
+if [ "$PRINT" = 0 ] && [ ${#TARGETS[@]} -eq 0 ]; then
+  die "give target instances with --instance-ids or --tag, or use --print-script"
+fi
+
+# ---------- the host script ----------
+# Settings are written with printf %q, so any pattern is passed literally. The body
+# below runs as root on the host (bash 3.2+ and coreutils; docker and the aws CLI
+# when present). IR_CAPTURE_PROC, read by the body, points it at a fake /proc tree
+# for tests.
+read -r -d '' HOST_BODY <<'HOST' || true
+set -u
+umask 077
+PROC=${IR_CAPTURE_PROC:-/proc}
+INSPECT_FORMAT='Id={{.Id}}
+Name={{.Name}}
+Image={{.Config.Image}}
+ImageId={{.Image}}
+Created={{.Created}}
+User={{.Config.User}}
+Entrypoint={{json .Config.Entrypoint}}
+Cmd={{json .Config.Cmd}}
+Labels={{json .Config.Labels}}
+State={{json .State}}
+Mounts={{json .Mounts}}
+Privileged={{.HostConfig.Privileged}}
+NetworkMode={{.HostConfig.NetworkMode}}'
+LOG_BYTES=52428800  # cap each container's log capture at 50 MB
+
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+started=$(date -u +%Y%m%dT%H%M%SZ)
+host=$(hostname 2>/dev/null || uname -n)
+name=$started-$host
+dir=$EVIDENCE_ROOT/$name
+# umask 077 makes every directory created here 0700, missing parents included
+if ! mkdir -p "$EVIDENCE_ROOT" || ! mkdir "$dir"; then
+  echo "ecs-ir-capture: cannot create $dir" >&2
+  exit 1
+fi
+note() { printf '%s %s\n' "$(utc)" "$*" >>"$dir/collection.log"; }
+note "start: host=$host user=$(id -un 2>/dev/null) pid=$$"
+note "settings: pattern=$PATTERN max_procs=$MAX_PROCS log_since=$LOG_SINCE redact=$REDACT"
+for v in AWS_SSM_INSTANCE_ID AWS_SSM_REGION_NAME; do
+  [ -z "${!v:-}" ] || note "$v=${!v}"
+done
+if [ -r /sys/devices/virtual/dmi/id/board_asset_tag ]; then
+  note "board_asset_tag=$(cat /sys/devices/virtual/dmi/id/board_asset_tag 2>/dev/null)"
+fi
+
+# Host context, before looking at any process.
+mkdir "$dir/host"
+{ utc; uname -a; uptime; } >"$dir/host/system.txt" 2>&1
+ps auxww >"$dir/host/ps.txt" 2>&1
+if command -v ss >/dev/null 2>&1; then ss -tanp >"$dir/host/sockets.txt" 2>&1; fi
+if command -v docker >/dev/null 2>&1; then docker ps -a --no-trunc >"$dir/host/docker-ps.txt" 2>&1; fi
+
+# Environment as one VAR=value per line (embedded newlines as \n), values of names
+# containing SECRET, PASSWORD, TOKEN or KEY replaced unless REDACT=0. Records are read
+# NUL-separated, so a multi-line value is redacted as a whole.
+environ_text() {
+  local entry key
+  while IFS= read -r -d '' entry || [ -n "$entry" ]; do
+    key=${entry%%=*}
+    if [ "$REDACT" = 1 ]; then
+      case $key in
+        *[Ss][Ee][Cc][Rr][Ee][Tt]* | *[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]* | *[Tt][Oo][Kk][Ee][Nn]* | *[Kk][Ee][Yy]*)
+          entry="$key=[REDACTED]" ;;
+      esac
+    fi
+    printf '%s\n' "${entry//$'\n'/\\n}"
+  done
+}
+
+containers=""
+capture_container() {
+  local cid=$1 c=$dir/container-${1:0:12}
+  mkdir "$c"
+  echo "$cid" >"$c/container-id.txt"
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker CLI not found" >"$c/errors.txt"
+    return
+  fi
+  docker inspect --format "$INSPECT_FORMAT" "$cid" >"$c/inspect.txt" 2>>"$c/errors.txt"
+  docker diff "$cid" >"$c/diff.txt" 2>>"$c/errors.txt"
+  # container stdout and stderr, interleaved, with docker's timestamps
+  docker logs --timestamps --since "$LOG_SINCE" "$cid" 2>&1 | head -c "$LOG_BYTES" >"$c/logs.txt"
+  [ -s "$c/errors.txt" ] || rm -f "$c/errors.txt"
+  note "container $cid: inspect, diff, logs since $LOG_SINCE"
+}
+
+summary=""
+capture() {
+  local pid=$1 d=$dir/proc-$1 cid exe_sum
+  mkdir "$d"
+  readlink "$PROC/$pid/exe" >"$d/exe.path" 2>>"$d/errors.txt"
+  # read through /proc: the binary that is running, even if the file was deleted or replaced
+  if cat "$PROC/$pid/exe" >"$d/exe" 2>>"$d/errors.txt"; then
+    (cd "$d" && sha256 exe >exe.sha256)
+  else
+    rm -f "$d/exe"
+  fi
+  # 2>> comes first so a failed input redirection is recorded too
+  tr '\0' ' ' 2>>"$d/errors.txt" <"$PROC/$pid/cmdline" >"$d/cmdline.txt" && echo >>"$d/cmdline.txt"
+  environ_text 2>>"$d/errors.txt" <"$PROC/$pid/environ" >"$d/environ.txt"
+  if [ "$REDACT" = 0 ]; then cat "$PROC/$pid/environ" >"$d/environ.raw" 2>>"$d/errors.txt"; fi
+  for f in status maps cgroup; do cat "$PROC/$pid/$f" >"$d/$f.txt" 2>>"$d/errors.txt"; done
+  readlink "$PROC/$pid/cwd" >"$d/cwd.txt" 2>>"$d/errors.txt"
+  ls -l "$PROC/$pid/fd/" >"$d/fd.txt" 2>>"$d/errors.txt"
+  [ -s "$d/errors.txt" ] || rm -f "$d/errors.txt"
+  cid=$(grep -Eo '[0-9a-f]{64}' "$d/cgroup.txt" 2>/dev/null | tail -n 1)
+  if [ -n "$cid" ]; then
+    echo "$cid" >"$d/container-id.txt"
+    case " $containers " in
+      *" $cid "*) ;;
+      *) containers="$containers $cid"; capture_container "$cid" ;;
+    esac
+  fi
+  exe_sum=$(cut -d ' ' -f 1 "$d/exe.sha256" 2>/dev/null)
+  note "pid $pid: exe=$(cat "$d/exe.path" 2>/dev/null) sha256=${exe_sum:-unreadable} container=${cid:-none}"
+  summary="$summary
+  pid $pid  exe $(cat "$d/exe.path" 2>/dev/null)  sha256 ${exe_sum:-unreadable}  container ${cid:0:12}"
+}
+
+# Matching processes. Skip this script and its own short-lived helpers, and kernel
+# threads (empty command line).
+self=$$
+pids=""
+total=0
+for p in "$PROC"/[0-9]*; do
+  [ -d "$p" ] || continue
+  pid=${p##*/}
+  [ "$pid" != "$self" ] || continue
+  ppid=$(sed -n 's/^PPid:[[:space:]]*//p' "$p/status" 2>/dev/null)
+  [ "$ppid" != "$self" ] || continue
+  cmd=$(tr '\0' ' ' 2>/dev/null <"$p/cmdline")
+  cmd=${cmd% }
+  [ -n "$cmd" ] || continue
+  printf '%s\n' "$cmd" | grep -Eq -- "$PATTERN" || continue
+  total=$((total + 1))
+  if [ "$total" -le "$MAX_PROCS" ]; then pids="$pids $pid"; fi
+done
+note "matched $total processes; capturing at most $MAX_PROCS"
+count=0
+for pid in $pids; do
+  capture "$pid"
+  count=$((count + 1))
+done
+note "done: captured $count processes"
+
+# Seal: manifest of every file, then the tarball and its checksum. collection.log is
+# complete at this point; nothing is written into the directory afterwards.
+files=$(cd "$dir" && find . -type f | LC_ALL=C sort)
+(cd "$dir" && printf '%s\n' "$files" | while IFS= read -r f; do sha256 "$f"; done) >"$dir/MANIFEST.sha256"
+status=0
+if tar -czf "$dir.tar.gz" -C "$EVIDENCE_ROOT" "$name" && (cd "$EVIDENCE_ROOT" && sha256 "$name.tar.gz" >"$name.tar.gz.sha256"); then
+  tar_sum=$(cut -d ' ' -f 1 "$dir.tar.gz.sha256")
+else
+  tar_sum=""
+  status=1
+fi
+for f in "$dir"/proc-*/exe; do
+  if [ -f "$f" ]; then chmod 000 "$f"; fi  # evidence, not to be run
+done
+
+echo "ecs-ir-capture on $host at $started"
+echo "pattern: $PATTERN"
+if [ "$total" -gt "$count" ]; then
+  echo "matched $total processes; captured the first $count (--max-procs)"
+else
+  echo "matched and captured $count processes"
+fi
+[ -z "$summary" ] || echo "${summary#?}"
+echo "evidence: $dir ($(find "$dir" -type f | wc -l | tr -d ' ') files)"
+if [ -n "$tar_sum" ]; then
+  echo "tarball:  $dir.tar.gz"
+  echo "sha256:   $tar_sum"
+else
+  echo "tarball:  FAILED; the evidence directory is intact"
+fi
+if [ -n "$S3_URI" ] && [ -n "$tar_sum" ]; then
+  dest=${S3_URI%/}/$name.tar.gz
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "upload:   FAILED, no aws CLI on this host; copy $dir.tar.gz yourself"
+    status=1
+  elif aws s3 cp "$dir.tar.gz" "$dest" --only-show-errors &&
+    aws s3 cp "$dir.tar.gz.sha256" "$dest.sha256" --only-show-errors; then
+    echo "uploaded: $dest"
+  else
+    echo "upload:   FAILED; the tarball is still at $dir.tar.gz"
+    status=1
+  fi
+fi
+exit $status
+HOST
+
+host_script() {
+  printf '#!/bin/bash\n'
+  printf '# ecs-ir-capture %s host script: read-only evidence capture. It never kills,\n' "$VERSION"
+  printf '# stops or pauses anything. Run it as root.\n'
+  printf 'PATTERN=%q\n' "$PATTERN"
+  printf 'MAX_PROCS=%d\n' "$((10#$MAX_PROCS))"
+  printf 'LOG_SINCE=%q\n' "$LOG_SINCE"
+  printf 'REDACT=%d\n' "$REDACT"
+  printf 'S3_URI=%q\n' "$S3_URI"
+  printf 'EVIDENCE_ROOT=%q\n' "$EVIDENCE_ROOT"
+  printf '%s\n' "$HOST_BODY"
+}
+
+if [ "$PRINT" = 1 ]; then
+  host_script
+  exit 0
+fi
+
+here=$(cd "$(dirname "$0")" && pwd)
+if [ -x "$here/../ssm-run/ssm-run" ]; then
+  ssm_run=$here/../ssm-run/ssm-run
+elif command -v ssm-run >/dev/null 2>&1; then
+  ssm_run=$(command -v ssm-run)
+else
+  die "ssm-run not found: install it from the same repository, next to $PROG or on PATH"
+fi
+rc=0
+host_script | "$ssm_run" "${TARGETS[@]}" ${PASS[@]+"${PASS[@]}"} --timeout "$((10#$TIMEOUT))" \
+  --comment "ecs-ir-capture $VERSION" - || rc=$?
+exit $rc
