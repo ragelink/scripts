@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""ssm-run: run a local shell script on EC2 instances through SSM Run Command.
+
+Sends the script with the AWS-RunShellScript document, waits for it to finish, and
+prints each instance's status, exit code, stdout and stderr. Exit status: 0 when every
+instance succeeded, 1 when any did not (or none matched, or the wait ran out), 2 on a
+usage error or a failed AWS call.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "1.0.0"
+PROG = "ssm-run"
+POLL_SECONDS = 2
+TERMINAL = {"Success", "Cancelled", "Failed", "TimedOut"}
+OUTPUT_LIMIT = 24000  # SSM returns at most this many characters of stdout and of stderr
+INSTANCE_ID = re.compile(r"^m?i-[0-9a-f]{8,17}$")
+COUNT_OR_PERCENT = re.compile(r"^[0-9]+%?$")
+
+
+class Failure(Exception):
+    """An error to report and exit 2 on."""
+
+
+def die(msg, code=2):
+    sys.stderr.write("%s: %s\n" % (PROG, msg))
+    sys.exit(code)
+
+
+class Aws:
+    def __init__(self, profile, region):
+        self.base = ["aws"]
+        if profile:
+            self.base += ["--profile", profile]
+        if region:
+            self.base += ["--region", region]
+
+    def __call__(self, *args):
+        env = dict(os.environ, AWS_PAGER="")
+        proc = subprocess.run(self.base + list(args) + ["--output", "json"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        if proc.returncode != 0:
+            msg = proc.stderr.decode("utf-8", "replace").strip()
+            raise Failure("aws %s failed: %s" % (" ".join(args[:2]), msg or "exit %d" % proc.returncode))
+        try:
+            return json.loads(proc.stdout.decode("utf-8") or "null")
+        except ValueError:
+            raise Failure("aws %s returned output that is not JSON" % " ".join(args[:2]))
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Run a local shell script on EC2 instances through SSM Run Command "
+                    "(AWS-RunShellScript), wait for it, and print each instance's status, "
+                    "exit code, stdout and stderr.",
+        epilog="Exit status: 0 all instances succeeded; 1 any instance did not, no instance "
+               "matched, or the wait ran out; 2 usage error or failed AWS call.")
+    p.add_argument("script", nargs="?", default="-",
+                   help="local script file, or - (the default) to read it from stdin")
+    t = p.add_argument_group("targets (one kind is required)")
+    t.add_argument("-i", "--instance-ids", action="append", default=[], metavar="ID[,ID...]",
+                   help="instance ids, comma-separated or repeated (at most 50)")
+    t.add_argument("-t", "--tag", action="append", default=[], metavar="KEY=VALUE",
+                   help="instances with this tag; repeat a key for alternative values, "
+                        "and different keys must all match")
+    p.add_argument("--timeout", type=int, default=600, metavar="SECONDS",
+                   help="stop the script on the host after SECONDS (default 600)")
+    p.add_argument("--wait", type=int, metavar="SECONDS",
+                   help="stop waiting locally after SECONDS (default: --timeout + 60)")
+    p.add_argument("--working-dir", metavar="DIR", help="working directory on the host")
+    p.add_argument("--comment", help="command comment (default: 'ssm-run SCRIPT')")
+    p.add_argument("--max-concurrency", metavar="N|N%", help="SSM MaxConcurrency")
+    p.add_argument("--max-errors", metavar="N|N%", help="SSM MaxErrors")
+    p.add_argument("--output-dir", metavar="DIR",
+                   help="also write INSTANCE.stdout, .stderr and .json files to DIR")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="print status lines and the summary, not the script output")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the send-command request as JSON and call nothing")
+    p.add_argument("--profile", help="AWS profile")
+    p.add_argument("--region", help="AWS region")
+    p.add_argument("-V", "--version", action="version", version="%s %s" % (PROG, VERSION))
+    args = p.parse_args(argv)
+
+    ids = [i for chunk in args.instance_ids for i in chunk.split(",") if i]
+    if bool(ids) == bool(args.tag):
+        p.error("give either --instance-ids or --tag")
+    bad = [i for i in ids if not INSTANCE_ID.match(i)]
+    if bad:
+        p.error("not an instance id: %s" % bad[0])
+    if len(set(ids)) > 50:
+        p.error("at most 50 instance ids per command; use --tag for larger fleets")
+    tags = []
+    for spec in args.tag:
+        key, sep, value = spec.partition("=")
+        if not sep or not key:
+            p.error("--tag needs KEY=VALUE, got %r" % spec)
+        tags.append((key, value))
+    if args.timeout < 1 or (args.wait is not None and args.wait < 1):
+        p.error("--timeout and --wait must be at least 1")
+    for name in ("max_concurrency", "max_errors"):
+        value = getattr(args, name)
+        if value is not None and not COUNT_OR_PERCENT.match(value):
+            p.error("--%s needs a number or a percentage" % name.replace("_", "-"))
+    args.ids = list(dict.fromkeys(ids))  # keep order, drop repeats
+    args.tags = tags
+    return args
+
+
+def read_script(path):
+    if path == "-":
+        if sys.stdin.isatty():
+            die("no script: name a file, or pipe the script in")
+        data = sys.stdin.buffer.read()
+    else:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            die("cannot read %s: %s" % (path, e.strerror))
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        die("the script is not UTF-8 text")
+    # One list element per line, exactly as written: split on \n only (str.splitlines would
+    # also split on form feeds and other separators), and drop the \r of CRLF line ends.
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines.pop()
+    lines = [line[:-1] if line.endswith("\r") else line for line in lines]
+    if not any(line.strip() for line in lines):
+        die("the script is empty")
+    return lines
+
+
+def build_request(args, commands):
+    params = {"commands": commands, "executionTimeout": [str(args.timeout)]}
+    if args.working_dir:
+        params["workingDirectory"] = [args.working_dir]
+    name = "stdin" if args.script == "-" else os.path.basename(args.script)
+    req = {
+        "DocumentName": "AWS-RunShellScript",
+        "Comment": (args.comment if args.comment is not None else "ssm-run " + name)[:100],
+        "Parameters": params,
+    }
+    if args.ids:
+        req["InstanceIds"] = args.ids
+    else:
+        by_key = {}
+        for key, value in args.tags:
+            by_key.setdefault(key, []).append(value)
+        req["Targets"] = [{"Key": "tag:" + k, "Values": v} for k, v in by_key.items()]
+    if args.max_concurrency:
+        req["MaxConcurrency"] = args.max_concurrency
+    if args.max_errors:
+        req["MaxErrors"] = args.max_errors
+    return req
+
+
+def send(aws, req):
+    # The script travels in a file, not on the command line: no argv size limit, no
+    # quoting, nothing in the process list. The temporary directory is 0700.
+    with tempfile.TemporaryDirectory(prefix="ssm-run.") as tmp:
+        path = os.path.join(tmp, "request.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(req, f)
+        out = aws("ssm", "send-command", "--cli-input-json", "file://" + path)
+    try:
+        return out["Command"]["CommandId"]
+    except (TypeError, KeyError):
+        raise Failure("aws ssm send-command returned no CommandId")
+
+
+def wait_for(aws, command_id, seconds):
+    """Poll until the command reaches a terminal status. Returns (status, finished)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        commands = aws("ssm", "list-commands", "--command-id", command_id).get("Commands") or []
+        status = commands[0].get("Status", "Pending") if commands else "Pending"
+        if status in TERMINAL:
+            return status, True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return status, False
+        time.sleep(min(POLL_SECONDS, remaining))
+
+
+def ensure_text(s):
+    return s if not s or s.endswith("\n") else s + "\n"
+
+
+def report(aws, args, command_id, inv):
+    """Print one instance's result. Returns (instance id, status, exit code)."""
+    iid, status = inv["InstanceId"], inv.get("Status", "Unknown")
+    if status not in TERMINAL:
+        print("== %s: %s" % (iid, status))
+        return iid, status, None
+    d = aws("ssm", "get-command-invocation", "--command-id", command_id, "--instance-id", iid)
+    status = d.get("Status", status)
+    code = d.get("ResponseCode")
+    code = None if code is None or code < 0 else code
+    details = d.get("StatusDetails") or status
+    out, err = d.get("StandardOutputContent") or "", d.get("StandardErrorContent") or ""
+    head = "== %s: %s" % (iid, status if details == status else "%s (%s)" % (status, details))
+    print(head + ("" if code is None else ", exit %d" % code))
+    if not args.quiet:
+        sys.stdout.write(ensure_text(out))
+        if err:
+            print("-- stderr")
+            sys.stdout.write(ensure_text(err))
+    for name, text in (("stdout", out), ("stderr", err)):
+        if len(text) >= OUTPUT_LIMIT:
+            print("(%s: %s truncated by SSM at %d characters)" % (iid, name, OUTPUT_LIMIT))
+    if args.output_dir:
+        base = os.path.join(args.output_dir, iid)
+        for suffix, text in ((".stdout", out), (".stderr", err)):
+            with open(base + suffix, "w", encoding="utf-8") as f:
+                f.write(text)
+        with open(base + ".json", "w", encoding="utf-8") as f:
+            json.dump({"CommandId": command_id, "InstanceId": iid, "Status": status,
+                       "StatusDetails": details, "ResponseCode": code}, f, indent=2)
+            f.write("\n")
+    return iid, status, code
+
+
+def main(argv):
+    args = parse_args(argv)
+    req = build_request(args, read_script(args.script))
+    if args.dry_run:
+        print(json.dumps(req, indent=2, ensure_ascii=False))
+        return 0
+    os.umask(0o077)  # the request and result files may hold secrets
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    aws = Aws(args.profile, args.region)
+    command_id = send(aws, req)
+    wait = args.wait if args.wait is not None else args.timeout + 60
+    sys.stderr.write("%s: sent command %s; waiting up to %ds\n" % (PROG, command_id, wait))
+    status, finished = wait_for(aws, command_id, wait)
+    invocations = aws("ssm", "list-command-invocations", "--command-id", command_id)
+    invocations = sorted(invocations.get("CommandInvocations") or [], key=lambda i: i["InstanceId"])
+    if not invocations:
+        if finished:
+            print("no instances matched the targets (command %s: %s)" % (command_id, status))
+        else:
+            print("no instance picked up command %s within %ds" % (command_id, wait))
+        return 1
+
+    results = [report(aws, args, command_id, inv) for inv in invocations]
+    failed = [r for r in results if r[1] != "Success"]
+    print("%d instance%s: %d succeeded, %d did not" % (
+        len(results), "" if len(results) == 1 else "s", len(results) - len(failed), len(failed)))
+    for iid, st, code in failed:
+        print("  %s: %s%s" % (iid, st, "" if code is None else " (exit %d)" % code))
+    if not finished:
+        print("still running after %ds: aws ssm list-command-invocations --command-id %s --details"
+              % (wait, command_id))
+    return 1 if failed or not finished else 0
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")  # remote output may not fit the locale
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Failure as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        die("interrupted; a command already sent keeps running on the hosts", 130)

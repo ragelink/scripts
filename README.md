@@ -9,6 +9,7 @@ one folder per tool. Each folder has a README with the details.
 |---|---|---|
 | [clipsecret](clipsecret/) | Move secrets between the clipboard and AWS Secrets Manager without ever printing them | Bash, Python |
 | [csv-epoch-localtime](csv-epoch-localtime/) | Rewrite epoch UTC timestamps in a CSV (e.g. a Zoom chat export) as local time | Python |
+| [ssm-run](ssm-run/) | Run a local shell script on EC2 instances through SSM Run Command and print each instance's output | Python |
 
 ## Conventions
 
