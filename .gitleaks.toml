@@ -1,0 +1,8 @@
+# gitleaks configuration: the default rule set, unchanged.
+#
+# Allowlist entries are for verified false positives only. Each one must name the
+# file and the exact match, and say why it is safe. There are none yet.
+title = "scripts"
+
+[extend]
+useDefault = true
