@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""alb-log-grep: search Application Load Balancer access logs in S3, in parallel,
+and print the matching entries as TSV.
+
+Run `alb-log-grep --help` for usage. Needs python3 (3.8+) and the AWS CLI.
+"""
+import argparse
+import concurrent.futures
+import datetime as dt
+import gzip
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import zlib
+from urllib.parse import urlsplit
+
+VERSION = "1.0.0"
+PROG = "alb-log-grep"
+
+# ALB access log fields in log order. AWS appends new fields over time: older files
+# lack the trailing ones (they print as "-"), and fields past conn_trace_id are ignored.
+FIELDS = (
+    "type", "time", "elb", "client", "target",
+    "request_processing_time", "target_processing_time", "response_processing_time",
+    "elb_status_code", "target_status_code", "received_bytes", "sent_bytes",
+    "request", "user_agent", "ssl_cipher", "ssl_protocol", "target_group_arn",
+    "trace_id", "domain_name", "chosen_cert_arn", "matched_rule_priority",
+    "request_creation_time", "actions_executed", "redirect_url", "error_reason",
+    "target_port_list", "target_status_code_list", "classification",
+    "classification_reason", "conn_trace_id",
+)
+MIN_FIELDS = FIELDS.index("user_agent") + 1  # every ALB log format has at least these
+ALIASES = {
+    "elb_status": "elb_status_code",
+    "target_status": "target_status_code",
+    "request_time": "request_processing_time",
+    "target_time": "target_processing_time",
+    "response_time": "response_processing_time",
+}
+DERIVED = ("method", "url", "protocol", "path", "client_ip", "client_port",
+           "target_ip", "target_port", "key", "raw")
+DEFAULT_FIELDS = ("time,client,elb_status,target_status,method,url,request_time,"
+                  "target_time,response_time,received_bytes,sent_bytes,user_agent,trace_id")
+
+# A log file holds about the 5 minutes before the end time in its name. Long
+# requests and late entries can stray further, so files are read from 5 minutes
+# before --start to 10 minutes after --end; entries are then filtered by their own time.
+INTERVAL = dt.timedelta(minutes=5)
+SLACK = dt.timedelta(minutes=5)
+
+TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|(\S+)')
+UNESCAPE = re.compile(r'\\(["\\])')
+ENTRY_TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d")
+FILE_END_TIME = re.compile(r"_(\d{8}T\d{4}Z)_")
+STOP = threading.Event()
+
+EXAMPLES = """\
+examples:
+  alb-log-grep --bucket my-alb-logs --lb my-alb --start 2026-10-01 --status 5xx
+  alb-log-grep --bucket my-alb-logs --prefix lb-logs --lb my-alb \\
+      --start 2026-10-01T12:00Z --end 2026-10-01T13:00Z --client 203.0.113.0/24
+  alb-log-grep --bucket my-alb-logs --lb my-alb --start 2026-10-01 --end 2026-10-03 \\
+      --path '^/admin' --method POST --fields time,client_ip,path,elb_status,user_agent
+
+exit status: 0 = matches printed, 1 = no matches, 2 = usage error, or an object or
+listing that could not be read or parsed (other matches are still printed)
+"""
+
+
+class Failure(Exception):
+    """A listing or discovery problem that stops the search (exit 2)."""
+
+
+def say(msg):
+    sys.stderr.write("%s: %s\n" % (PROG, msg))
+    sys.stderr.flush()
+
+
+# ---------- arguments ----------
+
+def parse_time(value, option, end=False):
+    """UTC datetime from YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS]Z; an end date means the day after."""
+    try:
+        m = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)", value)
+        if m:
+            day = dt.datetime(int(m[1]), int(m[2]), int(m[3]), tzinfo=dt.timezone.utc)
+            return day + dt.timedelta(days=1) if end else day
+        m = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)(?::(\d\d))?Z", value)
+        if m:
+            return dt.datetime(*(int(g or 0) for g in m.groups()), tzinfo=dt.timezone.utc)
+    except ValueError:
+        pass
+    raise ValueError("%s: expected YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS]Z (UTC), got %r" % (option, value))
+
+
+def status_matcher(spec, option):
+    """Match status codes against a list of codes (502) and classes (5xx)."""
+    codes, classes = set(), set()
+    for item in (s.strip() for s in spec.split(",")):
+        if re.fullmatch(r"[1-5]\d\d", item):
+            codes.add(item)
+        elif re.fullmatch(r"[1-5][xX][xX]", item):
+            classes.add(item[0])
+        else:
+            raise ValueError("%s: expected codes like 502 or classes like 5xx, got %r" % (option, item))
+    return lambda code: code in codes or (len(code) == 3 and code.isdigit() and code[0] in classes)
+
+
+def compile_regex(pattern, option):
+    if pattern is None:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        raise ValueError("%s: bad regex %r (%s)" % (option, pattern, exc))
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog=PROG, allow_abbrev=False, epilog=EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Search ALB access logs in S3, in parallel, and print matching entries as TSV.")
+    p.add_argument("-V", "--version", action="version", version="%s %s" % (PROG, VERSION))
+    where = p.add_argument_group("where to look")
+    where.add_argument("--bucket", required=True, help="S3 bucket holding the logs")
+    where.add_argument("--prefix", default="", help="key prefix in front of AWSLogs/ (the load balancer's log prefix)")
+    where.add_argument("--lb", required=True, metavar="NAME", help="load balancer name (exact: my-alb does not match my-alb-2)")
+    where.add_argument("--account-id", metavar="ID", help="account folder under AWSLogs/ (default: every one found)")
+    where.add_argument("--log-region", metavar="REGION", help="region folder of the logs (default: every one found)")
+    where.add_argument("--start", required=True, help="YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS]Z, UTC")
+    where.add_argument("--end", help="exclusive end, same formats; a date means the end of that day "
+                                     "(default: the end of --start's day)")
+    what = p.add_argument_group("filters (all must match)")
+    what.add_argument("--path", metavar="REGEX", help="regex searched in the URL path")
+    what.add_argument("--url", metavar="REGEX", help="regex searched in the full request URL")
+    what.add_argument("--client", metavar="IP|CIDR", help="client address or network, IPv4 or IPv6")
+    what.add_argument("--status", metavar="CODES", help="ELB status codes or classes, e.g. 5xx or 502,503")
+    what.add_argument("--target-status", metavar="CODES", help="target status codes or classes")
+    what.add_argument("--method", metavar="LIST", help="HTTP methods, e.g. GET,POST")
+    out = p.add_argument_group("output and execution")
+    out.add_argument("--fields", metavar="LIST", default=DEFAULT_FIELDS,
+                     help="comma-separated output columns (default: %(default)s)")
+    out.add_argument("--no-header", action="store_true", help="do not print the header line")
+    out.add_argument("--jobs", type=int, default=8, metavar="N", help="objects searched in parallel (default 8)")
+    out.add_argument("--profile", metavar="NAME", help="AWS profile")
+    out.add_argument("--region", metavar="REGION", help="AWS API region for the S3 calls (not the log region)")
+    args = p.parse_args(argv)
+
+    if not args.bucket or "/" in args.bucket:
+        p.error("--bucket: give the bucket name only, without s3:// or a path")
+    if not re.fullmatch(r"[A-Za-z0-9-]+", args.lb):
+        p.error("--lb: load balancer names use letters, digits and hyphens, got %r" % args.lb)
+    for opt, val in (("--account-id", args.account_id), ("--log-region", args.log_region)):
+        if val is not None and (not val or "/" in val):
+            p.error("%s: expected a single folder name, got %r" % (opt, val))
+    if not 1 <= args.jobs <= 64:
+        p.error("--jobs: expected 1 to 64, got %d" % args.jobs)
+    try:
+        args.start_time = parse_time(args.start, "--start")
+        if args.end:
+            args.end_time = parse_time(args.end, "--end", end=True)
+        else:
+            day = args.start_time
+            args.end_time = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc) + dt.timedelta(days=1)
+        if args.end_time <= args.start_time:
+            raise ValueError("--end must be after --start")
+        args.path_re = compile_regex(args.path, "--path")
+        args.url_re = compile_regex(args.url, "--url")
+        args.client_net = None
+        if args.client:
+            try:
+                args.client_net = ipaddress.ip_network(args.client, strict=False)
+            except ValueError:
+                raise ValueError("--client: expected an IP address or CIDR, got %r" % args.client)
+        args.status_ok = status_matcher(args.status, "--status") if args.status else None
+        args.target_status_ok = (status_matcher(args.target_status, "--target-status")
+                                 if args.target_status else None)
+        args.methods = None
+        if args.method:
+            args.methods = {m.strip().upper() for m in args.method.split(",")}
+            if not all(re.fullmatch(r"[A-Z]+", m) for m in args.methods):
+                raise ValueError("--method: expected names like GET,POST, got %r" % args.method)
+        args.columns = [f.strip() for f in args.fields.split(",")]
+        unknown = [f for f in args.columns if f not in FIELDS and f not in ALIASES and f not in DERIVED]
+        if unknown:
+            raise ValueError("--fields: unknown %s; choose from %s" % (
+                ", ".join(unknown), ", ".join(FIELDS + tuple(ALIASES) + DERIVED)))
+    except ValueError as exc:
+        p.error(str(exc))
+    return args
+
+
+# ---------- AWS CLI ----------
+
+class Aws:
+    def __init__(self, profile, region):
+        self.base = ["aws"]
+        if profile:
+            self.base += ["--profile", profile]
+        if region:
+            self.base += ["--region", region]
+        self.env = dict(os.environ, AWS_PAGER="")
+
+    def list(self, bucket, prefix, delimiter=False):
+        """(keys, common prefixes) under prefix; the CLI follows the pagination."""
+        argv = self.base + ["s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix]
+        if delimiter:
+            argv += ["--delimiter", "/"]
+        argv += ["--output", "json"]
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+        if proc.returncode != 0:
+            raise Failure("listing s3://%s/%s failed: %s" % (
+                bucket, prefix, proc.stderr.decode("utf-8", "replace").strip()))
+        text = proc.stdout.decode("utf-8", "replace").strip()
+        try:
+            data = json.loads(text) if text else {}
+        except ValueError:
+            raise Failure("unexpected output from aws s3api list-objects-v2 for s3://%s/%s" % (bucket, prefix))
+        return ([c["Key"] for c in data.get("Contents") or []],
+                [c["Prefix"] for c in data.get("CommonPrefixes") or []])
+
+    def stream(self, bucket, key):
+        """A process whose stdout is the object's bytes."""
+        argv = self.base + ["s3", "cp", "s3://%s/%s" % (bucket, key), "-", "--only-show-errors"]
+        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+
+
+# ---------- finding the log files ----------
+
+def folders(aws, bucket, parent):
+    _, prefixes = aws.list(bucket, parent, delimiter=True)
+    return [p[len(parent):].rstrip("/") for p in prefixes if p.startswith(parent)]
+
+
+def account_regions(aws, args, base):
+    accounts = [args.account_id] if args.account_id else folders(aws, args.bucket, base + "AWSLogs/")
+    if not accounts:
+        raise Failure("no AWSLogs/<account-id>/ folders under s3://%s/%s (--prefix is the part before AWSLogs/)"
+                      % (args.bucket, base))
+    pairs = []
+    for account in accounts:
+        parent = "%sAWSLogs/%s/elasticloadbalancing/" % (base, account)
+        regions = [args.log_region] if args.log_region else folders(aws, args.bucket, parent)
+        pairs += [(account, region) for region in regions]
+    if not pairs:
+        raise Failure("no AWSLogs/<account-id>/elasticloadbalancing/<region>/ folders under s3://%s/%s"
+                      % (args.bucket, base))
+    return pairs
+
+
+def file_end_time(key):
+    m = FILE_END_TIME.search(key.rsplit("/", 1)[-1])
+    try:
+        return dt.datetime.strptime(m.group(1), "%Y%m%dT%H%MZ").replace(tzinfo=dt.timezone.utc)
+    except (AttributeError, ValueError):  # no time in the name, or not a real date: keep the file
+        return None
+
+
+def find_keys(aws, args, base, pool):
+    """Log files of the load balancer that can hold entries in the range, in time order."""
+    first, last = args.start_time - SLACK, args.end_time + INTERVAL + SLACK
+    days, day = [], first.date()
+    while day <= (last - dt.timedelta(microseconds=1)).date():
+        days.append(day)
+        day += dt.timedelta(days=1)
+    prefixes = []
+    for account, region in account_regions(aws, args, base):
+        for day in days:
+            # the day folder plus the file-name prefix of this load balancer
+            prefixes.append("%sAWSLogs/%s/elasticloadbalancing/%s/%s/%s_elasticloadbalancing_%s_app.%s." % (
+                base, account, region, day.strftime("%Y/%m/%d"), account, region, args.lb))
+    needle = "_app.%s." % args.lb
+    found = []
+    for keys, _ in pool.map(lambda prefix: aws.list(args.bucket, prefix), prefixes):
+        for key in keys:
+            if needle not in key.rsplit("/", 1)[-1]:
+                continue
+            end = file_end_time(key)
+            if end is not None and not first <= end < last:
+                continue
+            found.append((end or dt.datetime.min.replace(tzinfo=dt.timezone.utc), key))
+    found.sort()
+    return [key for _, key in found], len(prefixes)
+
+
+# ---------- parsing and matching ----------
+
+def split_request(request):
+    """'GET https://host/p HTTP/1.1' -> (method, url, protocol); '- - - ' -> ('-', '-', '-')."""
+    request = request.strip()
+    if not request or request == "- - -":
+        return "-", "-", "-"
+    parts = request.split(" ")
+    if len(parts) >= 3 and parts[-1].startswith("HTTP/"):
+        return parts[0], " ".join(parts[1:-1]), parts[-1]
+    return parts[0], " ".join(parts[1:]) or "-", "-"
+
+
+def split_hostport(value):
+    """'192.0.2.1:443' or '2001:db8::1:443' (IPv6 is logged without brackets) -> (ip, port)."""
+    host, sep, port = value.rpartition(":")
+    if not sep or not host:
+        return value, "-"
+    return host.strip("[]"), port
+
+
+def url_path(url):
+    try:
+        return urlsplit(url).path or "-"
+    except ValueError:
+        return "-"
+
+
+def parse_entry(line):
+    """A dict of the entry's fields, or None when the line is not an ALB log entry."""
+    tokens = [bare if bare else UNESCAPE.sub(r"\1", quoted) for quoted, bare in TOKEN.findall(line)]
+    if len(tokens) < MIN_FIELDS or not ENTRY_TIME.match(tokens[1]):
+        return None
+    entry = dict(zip(FIELDS, tokens))
+    entry["method"], entry["url"], entry["protocol"] = split_request(entry["request"])
+    entry["client_ip"], entry["client_port"] = split_hostport(entry["client"])
+    entry["target_ip"], entry["target_port"] = split_hostport(entry["target"])
+    entry["raw"] = line
+    return entry
+
+
+def matches(entry, args, start, end):
+    when = entry["time"][:19]
+    if when < start or when >= end:
+        return False
+    if args.status_ok and not args.status_ok(entry["elb_status_code"]):
+        return False
+    if args.target_status_ok and not args.target_status_ok(entry["target_status_code"]):
+        return False
+    if args.methods and entry["method"].upper() not in args.methods:
+        return False
+    if args.url_re and not args.url_re.search(entry["url"]):
+        return False
+    if args.path_re and not args.path_re.search(url_path(entry["url"])):
+        return False
+    if args.client_net:
+        try:
+            if ipaddress.ip_address(entry["client_ip"]) not in args.client_net:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def tsv(value):
+    return (value.replace("\\", "\\\\").replace("\t", "\\t")
+            .replace("\n", "\\n").replace("\r", "\\r"))
+
+
+def column(entry, name, key):
+    if name == "key":
+        return key
+    if name == "path":
+        return url_path(entry["url"])
+    return entry.get(ALIASES.get(name, name), "-")
+
+
+# ---------- searching one object ----------
+
+def search(aws, args, key):
+    """Stream one log file. Returns (rows, entries, malformed lines, error or None)."""
+    rows, entries, malformed, error = [], 0, 0, None
+    if STOP.is_set():
+        return rows, entries, malformed, "interrupted"
+    start = args.start_time.strftime("%Y-%m-%dT%H:%M:%S")
+    end = args.end_time.strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        proc = aws.stream(args.bucket, key)
+    except OSError as exc:
+        return rows, entries, malformed, "could not run aws: %s" % exc
+    try:
+        with gzip.GzipFile(fileobj=proc.stdout, mode="rb") as lines:
+            for raw in lines:
+                if STOP.is_set():
+                    error = "interrupted"
+                    break
+                line = raw.decode("utf-8", "backslashreplace").rstrip("\r\n")
+                if not line:
+                    continue
+                entry = parse_entry(line)
+                if entry is None:
+                    malformed += 1
+                    continue
+                entries += 1
+                if matches(entry, args, start, end):
+                    rows.append("\t".join(tsv(column(entry, name, key)) for name in args.columns))
+    except (OSError, EOFError, zlib.error) as exc:  # gzip.BadGzipFile is an OSError
+        error = "not a readable gzip stream (%s)" % (str(exc) or type(exc).__name__)
+    except Exception as exc:  # keep one bad object from stopping the others
+        error = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        if error:
+            proc.kill()
+        _, err = proc.communicate()
+    if proc.returncode and proc.returncode > 0:  # the CLI's own message explains everything else
+        error = " ".join(err.decode("utf-8", "replace").split()) or "aws s3 cp exited with %d" % proc.returncode
+    return rows, entries, malformed, error
+
+
+# ---------- main ----------
+
+def main(argv=None):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # stop quietly when piped into head, like grep
+    args = parse_args(argv)
+    if not shutil.which("aws"):
+        say("aws CLI not found")
+        return 2
+    aws = Aws(args.profile, args.region)
+    base = args.prefix.strip("/")
+    base = base + "/" if base else ""
+    out = sys.stdout.buffer
+    status, matched, entries, searched = 1, 0, 0, 0
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs)
+    try:
+        keys, listed = find_keys(aws, args, base, pool)
+        if not keys:
+            say("no log files for %s in s3://%s/%sAWSLogs/ between %s and %s (%d day prefixes listed)" % (
+                args.lb, args.bucket, base, args.start_time.isoformat(), args.end_time.isoformat(), listed))
+            return 1
+        header_due = not args.no_header
+        for key, (rows, count, malformed, error) in zip(keys, pool.map(lambda k: search(aws, args, k), keys)):
+            searched += 1
+            entries += count
+            if error:
+                say("s3://%s/%s: %s" % (args.bucket, key, error))
+                status = 2
+            if malformed:
+                say("s3://%s/%s: skipped %d malformed line(s)" % (args.bucket, key, malformed))
+                status = 2
+            if rows:
+                if header_due:
+                    out.write(("\t".join(args.columns) + "\n").encode("utf-8"))
+                    header_due = False
+                out.write(("\n".join(rows) + "\n").encode("utf-8"))
+                out.flush()
+                matched += len(rows)
+        say("searched %d file(s), %d entries, %d matched" % (searched, entries, matched))
+        if status != 2:
+            status = 0 if matched else 1
+        return status
+    except Failure as exc:
+        say(str(exc))
+        return 2
+    except KeyboardInterrupt:
+        STOP.set()
+        say("interrupted")
+        return 130
+    finally:
+        STOP.set()  # queued objects return at once instead of downloading
+        pool.shutdown(wait=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,6 +7,7 @@ one folder per tool. Each folder has a README with the details.
 
 | Tool | What it does | Language |
 |---|---|---|
+| [alb-log-grep](alb-log-grep/) | Search ALB access logs in S3 in parallel over a date range, filter by path, client, status or method, print TSV | Python |
 | [clipsecret](clipsecret/) | Move secrets between the clipboard and AWS Secrets Manager without ever printing them | Bash, Python |
 | [csv-epoch-localtime](csv-epoch-localtime/) | Rewrite epoch UTC timestamps in a CSV (e.g. a Zoom chat export) as local time | Python |
 | [ecs-ir-capture](ecs-ir-capture/) | Read-only incident-response capture on ECS/EC2 hosts via SSM: binaries, environment, container diff and logs of matching processes | Bash |
