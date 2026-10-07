@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""ecr-retag-verify: do two ECR image references hold the same image content?
+
+Each reference is resolved to the image manifest for one platform (picked from a
+multi-platform index when needed). The two are then compared by config digest and
+by the ordered list of layer digests. Manifest digests can differ for identical
+content; the report says why.
+
+Exit status: 0 identical content, 1 content differs, 2 usage or runtime error.
+"""
+import argparse
+import collections
+import json
+import os
+import re
+import subprocess
+import sys
+
+VERSION = "1.0.0"
+PROG = "ecr-retag-verify"
+
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+DOCKER_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
+OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
+ACCEPTED_MEDIA_TYPES = [OCI_INDEX, DOCKER_LIST, OCI_MANIFEST, DOCKER_MANIFEST]
+INDEX_TYPES = (OCI_INDEX, DOCKER_LIST)
+IMAGE_TYPES = (OCI_MANIFEST, DOCKER_MANIFEST)
+TYPE_NAMES = {
+    OCI_INDEX: "OCI image index",
+    DOCKER_LIST: "Docker manifest list",
+    OCI_MANIFEST: "OCI image manifest",
+    DOCKER_MANIFEST: "Docker image manifest v2",
+}
+SCHEMA1_PREFIX = "application/vnd.docker.distribution.manifest.v1"
+
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
+REPO_RE = re.compile(r"^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+PLATFORM_RE = re.compile(r"^[a-z0-9]+/[a-z0-9_]+(?:/[a-z0-9]+)?$")
+
+Ref = collections.namedtuple("Ref", "text repo tag digest")
+
+
+class Failure(Exception):
+    """A runtime error: reported on stderr, exit status 2."""
+
+
+def parse_ref(text, default_repo):
+    """TAG, sha256:DIGEST, REPO:TAG or REPO@sha256:DIGEST -> Ref (ValueError if malformed)."""
+    repo, tag, digest = default_repo, None, None
+    if text.startswith("sha256:"):
+        digest = text
+    elif "@" in text:
+        repo, digest = text.split("@", 1)
+    elif ":" in text:
+        repo, tag = text.rsplit(":", 1)
+    else:
+        tag = text
+    if not repo:
+        raise ValueError("%s: no repository (use REPO:TAG, REPO@DIGEST or --repository)" % text)
+    if not REPO_RE.match(repo):
+        raise ValueError("%s: invalid repository name %r" % (text, repo))
+    if digest is not None and not DIGEST_RE.match(digest):
+        raise ValueError("%s: invalid digest (expected sha256: and 64 lowercase hex characters)" % text)
+    if tag is not None and not TAG_RE.match(tag):
+        raise ValueError("%s: invalid tag %r" % (text, tag))
+    return Ref(text, repo, tag, digest)
+
+
+def ref_name(ref):
+    return "%s:%s" % (ref.repo, ref.tag) if ref.tag else "%s@%s" % (ref.repo, ref.digest)
+
+
+def platform_name(platform):
+    if not platform.get("os") or not platform.get("architecture"):
+        return "(no platform)"
+    parts = [platform["os"], platform["architecture"]]
+    if platform.get("variant"):
+        parts.append(platform["variant"])
+    return "/".join(parts)
+
+
+def aws(opts, args):
+    """Run one aws CLI call and return its parsed JSON output."""
+    cmd = ["aws"]
+    if opts.profile:
+        cmd += ["--profile", opts.profile]
+    if opts.region:
+        cmd += ["--region", opts.region]
+    cmd += args
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=dict(os.environ, AWS_PAGER=""), encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise Failure("could not run the aws CLI (%s)" % (e.strerror or e))
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or "exit status %d" % proc.returncode
+        raise Failure("aws %s failed: %s" % (" ".join(args[:2]), detail))
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        raise Failure("could not parse the aws CLI output")
+
+
+def fetch(opts, cache, label, repo, tag=None, digest=None):
+    """batch-get-image one manifest -> (digest, media type, manifest)."""
+    if digest and (repo, digest) in cache:
+        return cache[(repo, digest)]
+    args = ["ecr", "batch-get-image", "--repository-name", repo]
+    if opts.registry_id:
+        args += ["--registry-id", opts.registry_id]
+    args += ["--image-ids", "imageDigest=" + digest if digest else "imageTag=" + tag,
+             "--accepted-media-types"] + ACCEPTED_MEDIA_TYPES + ["--output", "json"]
+    out = aws(opts, args)
+    images = out.get("images") or []
+    if not images:
+        failure = (out.get("failures") or [{}])[0]
+        code = failure.get("failureCode") or "no image returned"
+        reason = failure.get("failureReason")
+        raise Failure("%s: %s%s" % (label, code, " (%s)" % reason if reason else ""))
+    image = images[0]
+    try:
+        manifest = json.loads(image["imageManifest"])
+    except (KeyError, TypeError, ValueError):
+        manifest = None
+    if not isinstance(manifest, dict):
+        raise Failure("%s: the registry returned an unreadable manifest" % label)
+    media_type = image.get("imageManifestMediaType") or manifest.get("mediaType") or ""
+    if manifest.get("schemaVersion") == 1 or media_type.startswith(SCHEMA1_PREFIX):
+        raise Failure("%s: Docker schema 1 manifests are not supported (re-push the image)" % label)
+    if not media_type:  # OCI makes mediaType optional: go by structure
+        if "manifests" in manifest:
+            media_type = OCI_INDEX
+        elif "config" in manifest and "layers" in manifest:
+            media_type = OCI_MANIFEST
+    if media_type not in INDEX_TYPES + IMAGE_TYPES:
+        raise Failure("%s: unsupported manifest media type %s" % (label, media_type or "(none)"))
+    found = (image.get("imageId") or {}).get("imageDigest") or digest
+    result = (found, media_type, manifest)
+    cache[(repo, found)] = result
+    return result
+
+
+def variant_matches(arch, wanted, actual):
+    if wanted is None or wanted == actual:
+        return True
+    return arch == "arm64" and wanted == "v8" and not actual  # arm64 without a variant is v8
+
+
+def choose(index, platform, label):
+    """Pick the index entry for platform -> (entry, platform names, attestation count)."""
+    want_os, want_arch, want_variant = (platform.split("/") + [None])[:3]
+    names, attestations, matches = [], 0, []
+    for entry in index.get("manifests") or []:
+        p = entry.get("platform") or {}
+        annotations = entry.get("annotations") or {}
+        if (annotations.get("vnd.docker.reference.type") == "attestation-manifest"
+                or (p.get("os"), p.get("architecture")) == ("unknown", "unknown")):
+            attestations += 1
+            continue
+        names.append(platform_name(p))
+        if (p.get("os") == want_os and p.get("architecture") == want_arch
+                and variant_matches(want_arch, want_variant, p.get("variant"))
+                and entry.get("digest") not in [m.get("digest") for m in matches]):
+            matches.append(entry)
+    if not matches:
+        raise Failure("%s: no %s image in the index; it has: %s"
+                      % (label, platform, ", ".join(names) or "no platform images"))
+    if len(matches) > 1:
+        raise Failure("%s: %s matches several images (%s); add a variant to --platform"
+                      % (label, platform, ", ".join(platform_name(m.get("platform") or {}) for m in matches)))
+    return matches[0], names, attestations
+
+
+def resolve(opts, cache, label, ref):
+    """Fetch a reference and resolve it to one image manifest -> report side."""
+    digest, media_type, manifest = fetch(opts, cache, label, ref.repo, ref.tag, ref.digest)
+    side = {
+        "reference": ref_name(ref), "repository": ref.repo, "tag": ref.tag, "digest": ref.digest,
+        "manifest": {"digest": digest, "media_type": media_type, "index": False,
+                     "platforms": [], "attestations": 0},
+    }
+    image_digest, image_type, image, platform = digest, media_type, manifest, None
+    if media_type in INDEX_TYPES:
+        entry, names, attestations = choose(manifest, opts.platform, label)
+        side["manifest"].update(index=True, platforms=names, attestations=attestations)
+        if not DIGEST_RE.match(entry.get("digest") or ""):
+            raise Failure("%s: the index entry for %s has no valid digest" % (label, opts.platform))
+        image_digest, image_type, image = fetch(opts, cache, label, ref.repo, digest=entry["digest"])
+        if image_type in INDEX_TYPES:
+            raise Failure("%s: nested indexes are not supported" % label)
+        platform = platform_name(entry.get("platform") or {})
+    config = (image.get("config") or {}).get("digest")
+    if not config:
+        raise Failure("%s: image manifest %s has no config" % (label, image_digest))
+    side["image"] = {"digest": image_digest, "media_type": image_type, "platform": platform,
+                     "annotations": image.get("annotations") or {}}
+    side["config_digest"] = config
+    side["layers"] = [layer.get("digest") for layer in image.get("layers") or []]
+    return side
+
+
+def entries_summary(manifest):
+    n = manifest["attestations"]
+    attestations = "%d attestation%s" % (n, "" if n == 1 else "s") if n else "no attestations"
+    return "%s; %s" % (", ".join(manifest["platforms"]) or "no platform images", attestations)
+
+
+def explain(a, b, same_config, same_layers):
+    """Notes on why digests differ for identical content, or on what differs."""
+    notes = []
+    am, bm, ai, bi = a["manifest"], b["manifest"], a["image"], b["image"]
+    if same_config and same_layers:
+        if am["digest"] == bm["digest"]:
+            return notes
+        if am["index"] != bm["index"]:
+            notes.append("%s is a multi-platform index and %s a single-platform manifest: an index digest "
+                         "covers every platform and attestation it lists, so it never equals a platform "
+                         "manifest's digest" % (("source", "target") if am["index"] else ("target", "source")))
+        elif am["index"] and am["digest"] != bm["digest"]:
+            found = False
+            if am["media_type"] != bm["media_type"]:
+                notes.append("the indexes use different media types (%s vs %s)"
+                             % (TYPE_NAMES[am["media_type"]], TYPE_NAMES[bm["media_type"]]))
+                found = True
+            if (am["platforms"], am["attestations"]) != (bm["platforms"], bm["attestations"]):
+                notes.append("the indexes list different entries (source: %s; target: %s): an index rebuilt "
+                             "with or without attestations or other platforms gets a new digest even when "
+                             "this platform's image is unchanged" % (entries_summary(am), entries_summary(bm)))
+                found = True
+            if not found:
+                notes.append("the indexes list the same platforms but differ in other bytes (annotations, "
+                             "entry order, formatting), as when an index is recreated or re-pushed")
+        if ai["digest"] != bi["digest"]:
+            if ai["media_type"] != bi["media_type"]:
+                notes.append("the image manifests use different media types (%s vs %s): converting between "
+                             "Docker and OCI formats rewrites the manifest, and so its digest"
+                             % (TYPE_NAMES[ai["media_type"]], TYPE_NAMES[bi["media_type"]]))
+            elif ai["annotations"] != bi["annotations"]:
+                notes.append("the image manifests carry different annotations, which are part of the "
+                             "manifest bytes")
+            else:
+                notes.append("the image manifests differ only in serialization or other fields, as after "
+                             "a re-push through docker pull/tag/push, which can rewrite the manifest")
+        notes.append("a retag inside the registry (aws ecr put-image with the original manifest) keeps "
+                     "the digest; pulling and pushing the image again may not")
+        return notes
+    if not same_config and same_layers:
+        notes.append("the layers are identical but the configs differ: the image configuration changed "
+                     "(environment, entrypoint, labels, or build history and timestamps), not the files")
+    elif not same_config:
+        notes.append("the config digest covers the image configuration (environment, entrypoint, labels, "
+                     "build history with timestamps) and the uncompressed layer digests: a rebuild almost "
+                     "always changes it, even from the same source")
+    if not same_layers:
+        if same_config:
+            notes.append("the configs are identical, and a config pins the uncompressed layer contents "
+                         "(rootfs.diff_ids), so the files are the same: the layers were most likely "
+                         "recompressed, which changes layer digests even for the same files")
+        else:
+            notes.append("layer digests are digests of the compressed blobs: recompression changes them "
+                         "even for the same files")
+        if sorted(a["layers"], key=str) == sorted(b["layers"], key=str):
+            notes.append("both sides have the same layers, in a different order")
+    return notes
+
+
+def compare(platform, a, b):
+    la, lb = a["layers"], b["layers"]
+    same_config = a["config_digest"] == b["config_digest"]
+    same_layers = la == lb
+    first = None
+    if not same_layers:
+        first = next((i for i, (x, y) in enumerate(zip(la, lb)) if x != y), min(len(la), len(lb)))
+    return {
+        "identical": same_config and same_layers,
+        "platform": platform,
+        "source": a,
+        "target": b,
+        "manifest_digests_equal": a["manifest"]["digest"] == b["manifest"]["digest"],
+        "image_digests_equal": a["image"]["digest"] == b["image"]["digest"],
+        "config": {"same": same_config, "source": a["config_digest"], "target": b["config_digest"]},
+        "layers": {"same": same_layers, "source_count": len(la), "target_count": len(lb),
+                   "first_difference": first,
+                   "added": [d for d in lb if d not in la], "removed": [d for d in la if d not in lb]},
+        "notes": explain(a, b, same_config, same_layers),
+    }
+
+
+def render(r):
+    out = []
+    for role in ("source", "target"):
+        side = r[role]
+        m, img = side["manifest"], side["image"]
+        out.append("%-9s %s" % (role, side["reference"]))
+        kind = TYPE_NAMES[m["media_type"]]
+        if m["index"]:
+            kind += " (%s)" % entries_summary(m)
+        out.append("  %-9s %s  %s" % ("manifest", m["digest"], kind))
+        if m["index"]:
+            out.append("  %-9s %s  %s for %s" % ("image", img["digest"], TYPE_NAMES[img["media_type"]],
+                                                img["platform"]))
+        else:
+            out.append("  %-9s same as manifest (single-platform; platform not checked)" % "image")
+    config, layers = r["config"], r["layers"]
+    if config["same"]:
+        out.append("%-9s %-10s %s" % ("config", "same", config["source"]))
+    else:
+        out.append("%-9s %-10s source %s" % ("config", "DIFFERENT", config["source"]))
+        out.append("%-9s %-10s target %s" % ("", "", config["target"]))
+    if layers["same"]:
+        n = layers["source_count"]
+        out.append("%-9s %-10s %d layer%s" % ("layers", "same", n, "" if n == 1 else "s"))
+    else:
+        out.append("%-9s %-10s source %d, target %d; first difference at index %d; %d added, %d removed"
+                   % ("layers", "DIFFERENT", layers["source_count"], layers["target_count"],
+                      layers["first_difference"], len(layers["added"]), len(layers["removed"])))
+    if not r["identical"]:
+        result = "content differs"
+    elif r["manifest_digests_equal"]:
+        result = "identical content (same manifest digest)"
+    else:
+        result = "identical content"
+    out.append("%-9s %s" % ("result", result))
+    if r["notes"]:
+        out.append("")
+        out.append("why the digests differ:" if r["identical"] else "notes:")
+        out.extend("  - " + note for note in r["notes"])
+    return "\n".join(out)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=PROG, allow_abbrev=False, formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Check whether two ECR image references hold the same image content: the same\n"
+                    "config digest and the same ordered layer digests, after resolving multi-platform\n"
+                    "indexes for one platform. Manifest digests may differ for identical content.",
+        epilog="references: TAG, sha256:DIGEST, REPO:TAG or REPO@sha256:DIGEST\n"
+               "exit status: 0 identical content, 1 content differs, 2 usage or runtime error\n\n"
+               "examples:\n"
+               "  %(prog)s --repository my-app v1.2.3 prod\n"
+               "  %(prog)s my-app:v1.2.3 my-app-prod:v1.2.3 --profile acme\n"
+               "  %(prog)s --platform linux/arm64 --json my-app:v1.2.3 my-app:prod")
+    parser.add_argument("source", metavar="SOURCE", help="the image you expect (e.g. the tested tag)")
+    parser.add_argument("target", metavar="TARGET", help="the image to check (e.g. the deployed tag)")
+    parser.add_argument("--repository", metavar="REPO", help="repository for bare tags and digests")
+    parser.add_argument("--platform", metavar="OS/ARCH[/VARIANT]", default="linux/amd64",
+                        help="platform to pick from multi-platform indexes (default: linux/amd64)")
+    parser.add_argument("--registry-id", metavar="ID", help="registry id, when not the caller's account")
+    parser.add_argument("--json", action="store_true", help="print the report as one JSON object")
+    parser.add_argument("--profile", metavar="NAME", help="AWS profile")
+    parser.add_argument("--region", metavar="NAME", help="AWS region")
+    parser.add_argument("-V", "--version", action="version", version="%s %s" % (PROG, VERSION))
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    opts = parser.parse_args(argv)
+    if not PLATFORM_RE.match(opts.platform):
+        parser.error("--platform %r: expected OS/ARCH or OS/ARCH/VARIANT, e.g. linux/arm64" % opts.platform)
+    try:
+        source = parse_ref(opts.source, opts.repository)
+        target = parse_ref(opts.target, opts.repository)
+    except ValueError as e:
+        parser.error(str(e))
+    cache = {}
+    try:
+        a = resolve(opts, cache, "source " + ref_name(source), source)
+        b = resolve(opts, cache, "target " + ref_name(target), target)
+    except Failure as e:
+        sys.stderr.write("%s: %s\n" % (PROG, e))
+        return 2
+    report = compare(opts.platform, a, b)
+    print(json.dumps(report, indent=2) if opts.json else render(report))
+    return 0 if report["identical"] else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

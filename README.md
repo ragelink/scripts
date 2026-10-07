@@ -10,6 +10,7 @@ one folder per tool. Each folder has a README with the details.
 | [alb-log-grep](alb-log-grep/) | Search ALB access logs in S3 in parallel over a date range, filter by path, client, status or method, print TSV | Python |
 | [clipsecret](clipsecret/) | Move secrets between the clipboard and AWS Secrets Manager without ever printing them | Bash, Python |
 | [csv-epoch-localtime](csv-epoch-localtime/) | Rewrite epoch UTC timestamps in a CSV (e.g. a Zoom chat export) as local time | Python |
+| [ecr-retag-verify](ecr-retag-verify/) | Check two ECR tags or digests hold the same image content (config and layers), resolving multi-arch indexes | Python |
 | [ecs-ir-capture](ecs-ir-capture/) | Read-only incident-response capture on ECS/EC2 hosts via SSM: binaries, environment, container diff and logs of matching processes | Bash |
 | [flowlog-fanout](flowlog-fanout/) | Flag sources whose fan-out (distinct destination IPs per time bin) spikes in VPC flow logs, via Logs Insights | Python |
 | [ssm-run](ssm-run/) | Run a local shell script on EC2 instances through SSM Run Command and print each instance's output | Python |
