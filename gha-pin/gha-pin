@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""gha-pin: pin GitHub Actions `uses:` references to full commit SHAs.
+
+    gha-pin [--dry-run] [--dir DIR] [FILE...]
+
+Every `uses: owner/repo[/path]@ref` becomes `uses: owner/repo[/path]@<sha> # ref`.
+Refs are resolved with `gh api`; annotated tags are followed to the commit they tag.
+"""
+import argparse
+import difflib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+
+VERSION = "1.0.0"
+PROG = "gha-pin"
+
+# A `uses:` key outside block scalars: indentation, an optional list dash, the key, an
+# optionally quoted value, then an optional comment (YAML needs whitespace before `#`).
+USES_RE = re.compile(
+    r"""^(?P<lead>[ \t]*(?:-[ \t]+)?uses:[ \t]+)
+        (?P<q>["']?)(?P<value>[^\s"'\#]+)(?P=q)
+        (?P<trail>(?:[ \t]+\#.*)?[ \t]*)$""",
+    re.VERBOSE,
+)
+# A key whose value is a block scalar (`run: |`, `script: >-`): the more deeply indented
+# lines after it are text, such as a shell script that happens to mention `uses:`.
+BLOCK_RE = re.compile(r"^(?P<ind>[ \t]*(?:-[ \t]+)*)[^\s#].*?:[ \t]+[|>][0-9+-]*[ \t]*(?:#.*)?$")
+SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+MAX_TAG_DEPTH = 10
+
+
+class GhError(Exception):
+    """gh failed for a reason other than "not found": stop before writing anything."""
+
+
+def warn(msg):
+    sys.stderr.write("%s: %s\n" % (PROG, msg))
+
+
+def die(msg):
+    warn(msg)
+    sys.exit(2)
+
+
+def gh_api(path):
+    """`gh api PATH` as parsed JSON, or None when GitHub answers 404."""
+    try:
+        p = subprocess.run(["gh", "api", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise GhError("gh not found: install the GitHub CLI and run `gh auth login`")
+    if p.returncode == 0:
+        try:
+            return json.loads(p.stdout.decode("utf-8"))
+        except ValueError:
+            raise GhError("gh api %s: output is not JSON" % path)
+    err = p.stderr.decode("utf-8", "replace").strip()
+    if "HTTP 404" in err:
+        return None
+    raise GhError("gh api %s failed: %s" % (path, err or "exit status %d" % p.returncode))
+
+
+def git_object(data, path):
+    obj = data.get("object") if isinstance(data, dict) else None
+    if not (isinstance(obj, dict) and isinstance(obj.get("type"), str) and isinstance(obj.get("sha"), str)):
+        raise GhError("gh api %s: unexpected response" % path)
+    return obj
+
+
+class Resolver:
+    """Resolve (owner/repo, ref) to a commit SHA, at most one lookup chain per pair."""
+
+    def __init__(self):
+        self.cache = {}
+
+    def resolve(self, owner_repo, ref):
+        """(sha, kind) with kind "tag" or "branch", or (None, reason)."""
+        key = (owner_repo.lower(), ref)
+        if key not in self.cache:
+            self.cache[key] = self._lookup(owner_repo, ref)
+        return self.cache[key]
+
+    def _lookup(self, owner_repo, ref):
+        quoted = urllib.parse.quote(ref, safe="/")
+        kind, path = "tag", "repos/%s/git/ref/tags/%s" % (owner_repo, quoted)
+        data = gh_api(path)
+        if data is None:
+            kind, path = "branch", "repos/%s/git/ref/heads/%s" % (owner_repo, quoted)
+            data = gh_api(path)
+            if data is None:
+                return None, "no such tag or branch"
+        obj = git_object(data, path)
+        seen = set()
+        while obj["type"] == "tag":  # an annotated tag: follow the tag object to what it tags
+            if obj["sha"] in seen or len(seen) >= MAX_TAG_DEPTH:
+                return None, "the tag chain does not end in a commit"
+            seen.add(obj["sha"])
+            path = "repos/%s/git/tags/%s" % (owner_repo, obj["sha"])
+            data = gh_api(path)
+            if data is None:
+                return None, "tag object %s not found" % obj["sha"]
+            obj = git_object(data, path)
+        if obj["type"] != "commit" or not SHA_RE.match(obj["sha"]):
+            return None, "it points to a %s, not a commit" % obj["type"]
+        return obj["sha"].lower(), kind
+
+
+def split_lines(text):
+    """Lines with their endings ("\\n" or "\\r\\n"); the last one may have none."""
+    return re.findall(r"[^\n]*\n|[^\n]+$", text)
+
+
+def find_uses(text):
+    """(line index, match) for every `uses:` line that is not inside a block scalar."""
+    found = []
+    block_indent = None
+    for i, raw in enumerate(split_lines(text)):
+        line = raw.rstrip("\n").rstrip("\r")
+        if block_indent is not None:
+            if not line.strip() or len(line) - len(line.lstrip(" \t")) > block_indent:
+                continue
+            block_indent = None
+        b = BLOCK_RE.match(line)
+        if b:
+            block_indent = len(b.group("ind"))
+            continue
+        m = USES_RE.match(line)
+        if m:
+            found.append((i, m))
+    return found
+
+
+def classify(value):
+    """("local"|"docker"|"pinned"|"bad", None) or ("pin", (owner/repo, path, ref))."""
+    if value.startswith(("./", "../")):
+        return "local", None
+    if value.startswith("docker://"):
+        return "docker", None
+    path, at, ref = value.partition("@")
+    segments = path.split("/")
+    owner_repo = "/".join(segments[:2])
+    if not at or not ref or len(segments) < 2 or "" in segments or not REPO_RE.match(owner_repo):
+        return "bad", None
+    if SHA_RE.match(ref):
+        return "pinned", None
+    return "pin", (owner_repo, path, ref)
+
+
+def pinned_line(m, path, sha, ref):
+    """The `uses:` line pinned to sha, keeping quotes, comment spacing and comment text."""
+    trail = m.group("trail").rstrip()
+    comment = "# " + ref
+    if trail:
+        space = trail[: len(trail) - len(trail.lstrip())]
+        old = trail.lstrip()[1:].strip()
+        if old and old != ref:
+            comment += " " + old
+    else:
+        space = " "
+    q = m.group("q")
+    return "%s%s%s@%s%s%s%s" % (m.group("lead"), q, path, sha, q, space, comment)
+
+
+def unified_diff(name, old, new):
+    label = os.path.normpath(name).lstrip("/")
+    out = []
+    for line in difflib.unified_diff(split_lines(old), split_lines(new), "a/" + label, "b/" + label):
+        if not line.endswith("\n"):
+            line += "\n\\ No newline at end of file\n"
+        out.append(line)
+    return "".join(out)
+
+
+def write_atomic(path, data):
+    """Replace path's content via a temp file in the same directory, keeping its mode."""
+    real = os.path.realpath(path)
+    mode = stat.S_IMODE(os.stat(real).st_mode)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix="." + os.path.basename(real) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, real)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="Pin GitHub Actions `uses: owner/repo@ref` references to full commit SHAs, "
+        "keeping the ref as a trailing comment: `@<sha> # ref`.",
+        epilog="examples:\n"
+        "  gha-pin --dry-run              show what would change in .github/workflows\n"
+        "  gha-pin                        pin every workflow in .github/workflows\n"
+        "  gha-pin path/to/action.yml     pin a composite action\n\n"
+        "exit status: 0 success (also when nothing needed pinning), 1 some references\n"
+        "could not be resolved (all others were pinned), 2 usage or runtime error",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("files", nargs="*", metavar="FILE", help="workflow or action files (default: DIR/*.yml and DIR/*.yaml)")
+    p.add_argument("--dir", metavar="DIR", help="directory to scan when no FILE is given (default: .github/workflows)")
+    p.add_argument("--dry-run", action="store_true", help="print a unified diff instead of writing files")
+    p.add_argument("-V", "--version", action="version", version="%s %s" % (PROG, VERSION))
+    args = p.parse_args(argv)
+    if args.files and args.dir is not None:
+        p.error("give FILE arguments or --dir, not both")
+    return args
+
+
+def workflow_files(args):
+    if args.files:
+        for f in args.files:
+            if not os.path.isfile(f):
+                die("no such file: %s" % f)
+        return args.files
+    d = args.dir if args.dir is not None else os.path.join(".github", "workflows")
+    if not os.path.isdir(d):
+        die("no such directory: %s (run it from the repository root, or pass --dir or FILEs)" % d)
+    names = sorted(n for n in os.listdir(d) if n.endswith((".yml", ".yaml")))
+    return [os.path.join(d, n) for n in names if os.path.isfile(os.path.join(d, n))]
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    files = workflow_files(args)
+    if not files:
+        warn("no workflow files found; nothing to pin")
+        return 0
+
+    # 1. Read and parse everything first: a bad file stops the run before any gh call.
+    docs = []
+    for name in files:
+        try:
+            with open(name, "rb") as f:
+                text = f.read().decode("utf-8")
+        except OSError as e:
+            die("cannot read %s: %s" % (name, e.strerror))
+        except UnicodeDecodeError:
+            die("%s is not UTF-8 text" % name)
+        docs.append((name, text, [(i, m) + classify(m.group("value")) for i, m in find_uses(text)]))
+
+    # 2. Resolve each distinct reference once; a gh failure (other than 404) stops the run
+    #    with nothing written.
+    resolver = Resolver()
+    for _, _, uses in docs:
+        for _, _, kind, target in uses:
+            if kind == "pin":
+                resolver.resolve(target[0], target[2])
+
+    # 3. Rewrite, report per line, then write (or diff).
+    pinned = already = skipped = failed = 0
+    for name, text, uses in docs:
+        lines = split_lines(text)
+        for i, m, kind, target in uses:
+            where = "%s:%d" % (name, i + 1)
+            if kind in ("local", "docker"):
+                skipped += 1
+            elif kind == "pinned":
+                already += 1
+            elif kind == "bad":
+                failed += 1
+                warn("%s: not a pinnable reference: %s" % (where, m.group("value")))
+            else:
+                owner_repo, path, ref = target
+                sha, why = resolver.resolve(owner_repo, ref)
+                if sha is None:
+                    failed += 1
+                    warn("%s: cannot resolve %s@%s: %s" % (where, owner_repo, ref, why))
+                    continue
+                if why == "branch":
+                    warn("%s: note: %s@%s is a branch, a moving ref; pinned to its current head" % (where, owner_repo, ref))
+                ending = lines[i][len(lines[i].rstrip("\r\n")):]
+                lines[i] = pinned_line(m, path, sha, ref) + ending
+                pinned += 1
+        new = "".join(lines)
+        if new == text:
+            continue
+        if args.dry_run:
+            sys.stdout.buffer.write(unified_diff(name, text, new).encode("utf-8"))
+        else:
+            try:
+                write_atomic(name, new.encode("utf-8"))
+            except OSError as e:
+                die("cannot write %s: %s" % (name, e.strerror))
+
+    summary = "pinned %d, already pinned %d, skipped %d (local/docker), failed %d" % (pinned, already, skipped, failed)
+    warn(("dry run, nothing written: would have " + summary) if args.dry_run else summary)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except GhError as e:
+        warn("%s; nothing was written" % e)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)
